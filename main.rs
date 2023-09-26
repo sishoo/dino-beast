@@ -78,9 +78,12 @@ impl MainState {
     }
 }
 
+
+
 impl event::EventHandler<ggez::GameError> for MainState {
     fn update(&mut self, ctx: &mut Context) -> GameResult {
         for dino in 0..NUM_DINOS {
+            unimplemented!("DONT MAKE IT HAVE TOO MANY MEMORY ACCESS THINGS");
             let dino_x = self.dino_x[dino];
             let dino_y = self.dino_y[dino];
             let dist = self.dino_dist[dino];
@@ -114,15 +117,40 @@ impl event::EventHandler<ggez::GameError> for MainState {
                     second_quad = index;
                 }
             }
+
+            let min = min_quad;
+            let second = second_quad;
+
+            let (start, rev) = match (min, second) {
+                (0, 1) => (0, 0),
+                (1, 0) =>  (0, 1),
+                (1, 2) => (1, 0),
+                (2, 1) => (1, 1),
+                (2, 3) => (2, 0),
+                (3, 2) => (2, 1),
+                (3, 0) => (3, 0),
+                (0, 3) => (3, 1),
+                (_, _) => (0, 0)
+            };
+
+            let mut range: [f32; 90] = if rev == 1 {
+                RAD_ARRAY[start].into_iter().rev().collect::<Vec<f32>>().try_into().unwrap()
+            } else {
+                RAD_ARRAY[start]
+            };
+
+            for angle in range {
+                let new_x = dino_x + dist * angle.cos();
+                let new_y = dino_y + dist * angle.sin();
+                let new_dist = dist_of_xyxy(new_x, new_y, food_x, food_y);
+                if new_dist < DINO_SIZE + FOOD_SIZE {
+                    self.dino_x[dino] += dino_x - new_x;
+                    self.dino_y[dino] += dino_y - new_y;
+                    self.dino_dist[dino] = new_dist;
+                }
+            }
+
         }
-
-
-        // if second - 
-        if (second_quad - min_quad)
-
-
-
-
         // println!("fps {:?}", ctx.time.fps());
         Ok(())
     }
