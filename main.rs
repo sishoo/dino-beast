@@ -1,482 +1,491 @@
-use ggez::event;
-use ggez::glam::*;
-use ggez::graphics::{self, Color};
-use ggez::{Context, GameResult};
-use rand::prelude::*;
+use ash::util::*;
+use ash::vk;
+use std::default::Default;
+use std::ffi::CStr;
+use std::io::Write;
+use std::io::Read;
+use std::mem;
+use std::mem::align_of;
+use std::fs::OpenOptions;
+use std::io::Cursor;
+mod lib;
+use lib::*;
+use std::io::Seek;
 
-const SCREEN_WIDTH: f32 = 1000.0;
-const SCREEN_HEIGHT: f32 = 800.0;
+const SPIRV_MAGIC_NUM: u32 = 0x07230203;
 
-struct MainState {
-    dinos: Vec<Vec2>,
-    food: Vec<Vec2>
+#[derive(Clone, Debug, Copy)]
+struct Vertex {
+    pos: [f32; 4],
+    color: [f32; 4],
 }
 
-impl MainState {
-    fn new(num_dinos: usize, num_food: usize) -> Self {
-        let mut rng = rand::thread_rng();
-        let dinos = Vec::with_capacity(num_dinos);
-        let closest = Vec::with_capacity(num_dinos);
-        let unsorted_food = Vec::with_capacity(num_food);
-        let matched_food = Vec::with_capacity(num_dinos);
-
-        for _ in 0..num_dinos {
-            let x = rng.gen_range(0.0..SCREEN_WIDTH);
-            let y = rng.gen_range(0.0..SCREEN_HEIGHT);
-            dinos.push(Vec2::new(x, y));
-        }
-
-        for _ in 0..num_food {
-            let x = rng.gen_range(0.0..SCREEN_WIDTH);
-            let y = rng.gen_range(0.0..SCREEN_WIDTH);
-            unsorted_food.push(Vec2::new(x, y))
-        }
-
-        for dino in dinos {
-            let mut closest = f32::MAX;
-            let mut mindex = 0;
-            for (index, food) in unsorted_food.iter().enumerate() {
-                let dist = dist_of_xyxy(dino.x, dino.y, food.x, food.y);
-                if dist < closest {
-                    closest = dist;
-                    mindex = index;
-                }
-            }
-            closest.push(mindex);
-        }
-
-        for foodex in closest {
-            matched_food.push(unsorted_food[foodex]);
-        }
-
-        Self {
-            dinos: dinos,
-            food: matched_food
-        }
-    }
+macro_rules! inject_magic {
+    ($thing:expr) => {{
+        let mut new = $thing.to_vec();
+        let magic_bytes = SPIRV_MAGIC_NUM.to_be_bytes();
+        new.insert(0, magic_bytes[0]);
+        new.insert(1, magic_bytes[1]);
+        new.insert(2, magic_bytes[2]);
+        new.insert(3, magic_bytes[3]);
+        // new.insert(4, b'\n');
+        let padding: Vec<u8> = (0..(4 - (new.len() % 4))).map(|x| x as u8).collect();
+        new.extend(padding);
+        new
+    }}
 }
 
-impl event::EventHandler<ggez::GameError> for MainState {
-    fn update(&mut self, ctx: &mut Context) -> GameResult {
+fn main() -> std::io::Result<()> {
+    unsafe {
+        let base = ExampleBase::new(1920, 1080);
+        let renderpass_attachments = [
+            vk::AttachmentDescription {
+                format: base.surface_format.format,
+                samples: vk::SampleCountFlags::TYPE_1,
+                load_op: vk::AttachmentLoadOp::CLEAR,
+                store_op: vk::AttachmentStoreOp::STORE,
+                final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                ..Default::default()
+            },
+            vk::AttachmentDescription {
+                format: vk::Format::D16_UNORM,
+                samples: vk::SampleCountFlags::TYPE_1,
+                load_op: vk::AttachmentLoadOp::CLEAR,
+                initial_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                final_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                ..Default::default()
+            },
+        ];
+        let color_attachment_refs = [vk::AttachmentReference {
+            attachment: 0,
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        }];
+        let depth_attachment_ref = vk::AttachmentReference {
+            attachment: 1,
+            layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        };
+        let dependencies = [vk::SubpassDependency {
+            src_subpass: vk::SUBPASS_EXTERNAL,
+            src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_READ
+                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            ..Default::default()
+        }];
 
-    }
+        let subpass = vk::SubpassDescription::builder()
+            .color_attachments(&color_attachment_refs)
+            .depth_stencil_attachment(&depth_attachment_ref)
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS);
 
-    fn draw(&mut self, ctx: &mut Context) -> GameResult {
-        let mut canvas =
-            graphics::Canvas::from_frame(ctx, graphics::Color::from([0.1, 0.2, 0.3, 1.0]));
+        let renderpass_create_info = vk::RenderPassCreateInfo::builder()
+            .attachments(&renderpass_attachments)
+            .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(&dependencies);
 
-        let dino_mesh = graphics::Mesh::new_circle(
-            ctx,
-            graphics::DrawMode::fill(),
-            Vec2::new(0.0, 0.0),
-            10.0,
-            2.0,
-            Color::GREEN,
-        )?;
+        let renderpass = base
+            .device
+            .create_render_pass(&renderpass_create_info, None)
+            .unwrap();
 
-        let food_mesh = graphics::Mesh::new_circle(
-            ctx,
-            graphics::DrawMode::fill(),
-            Vec2::new(0.0, 0.0),
-            10.0,
-            2.0,
-            Color::RED,
-        )?;
+        let framebuffers: Vec<vk::Framebuffer> = base
+            .present_image_views
+            .iter()
+            .map(|&present_image_view| {
+                let framebuffer_attachments = [present_image_view, base.depth_image_view];
+                let frame_buffer_create_info = vk::FramebufferCreateInfo::builder()
+                    .render_pass(renderpass)
+                    .attachments(&framebuffer_attachments)
+                    .width(base.surface_resolution.width)
+                    .height(base.surface_resolution.height)
+                    .layers(1);
 
-        // let radius_mesh = graphics::Mesh::new_circle(
-        //     ctx,
-        //     graphics::DrawMode::stroke(5.0),
-        //     Vec2::new(0.0, 0.0),
-        //     ,
-        //     1.0,
-        //     Color::BLACK,
-        // )?;
+                base.device
+                    .create_framebuffer(&frame_buffer_create_info, None)
+                    .unwrap()
+            })
+            .collect();
 
-        // for dino in self.dinos {
-        //     canvas.draw(&dino_mesh, )
-        // }
-        canvas.finish(ctx)?;
-    }
-}
+        let index_buffer_data = [0u32, 1, 2];
+        let index_buffer_info = vk::BufferCreateInfo::builder()
+            .size(std::mem::size_of_val(&index_buffer_data) as u64)
+            .usage(vk::BufferUsageFlags::INDEX_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-fn dist_of_xyxy(x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
-    ((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1)).sqrt()
-}
-
-fn main() -> GameResult {
-    let cb = ggez::ContextBuilder::new("Dino Beast", "Mac")
-        .window_setup(
-            ggez::conf::WindowSetup::default()
-                .title("Dino Beast")
-                .vsync(false),
+        let index_buffer = base.device.create_buffer(&index_buffer_info, None).unwrap();
+        let index_buffer_memory_req = base.device.get_buffer_memory_requirements(index_buffer);
+        let index_buffer_memory_index = find_memorytype_index(
+            &index_buffer_memory_req,
+            &base.device_memory_properties,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
-        .window_mode(ggez::conf::WindowMode::default().dimensions(SCREEN_WIDTH, SCREEN_HEIGHT));
-    let (ctx, event_loop) = cb.build()?;
-    let state = MainState::new(1, 1)?;
-    event::run(ctx, event_loop, state)
+            .expect("Unable to find suitable memorytype for the index buffer.");
+
+        let index_allocate_info = vk::MemoryAllocateInfo {
+            allocation_size: index_buffer_memory_req.size,
+            memory_type_index: index_buffer_memory_index,
+            ..Default::default()
+        };
+        let index_buffer_memory = base
+            .device
+            .allocate_memory(&index_allocate_info, None)
+            .unwrap();
+        let index_ptr = base
+            .device
+            .map_memory(
+                index_buffer_memory,
+                0,
+                index_buffer_memory_req.size,
+                vk::MemoryMapFlags::empty(),
+            )
+            .unwrap();
+        let mut index_slice = Align::new(
+            index_ptr,
+            align_of::<u32>() as u64,
+            index_buffer_memory_req.size,
+        );
+        index_slice.copy_from_slice(&index_buffer_data);
+        base.device.unmap_memory(index_buffer_memory);
+        base.device
+            .bind_buffer_memory(index_buffer, index_buffer_memory, 0)
+            .unwrap();
+
+        let vertex_input_buffer_info = vk::BufferCreateInfo {
+            size: 3 * std::mem::size_of::<Vertex>() as u64,
+            usage: vk::BufferUsageFlags::VERTEX_BUFFER,
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            ..Default::default()
+        };
+
+        let vertex_input_buffer = base
+            .device
+            .create_buffer(&vertex_input_buffer_info, None)
+            .unwrap();
+
+        let vertex_input_buffer_memory_req = base
+            .device
+            .get_buffer_memory_requirements(vertex_input_buffer);
+
+        let vertex_input_buffer_memory_index = find_memorytype_index(
+            &vertex_input_buffer_memory_req,
+            &base.device_memory_properties,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+            .expect("Unable to find suitable memorytype for the vertex buffer.");
+
+        let vertex_buffer_allocate_info = vk::MemoryAllocateInfo {
+            allocation_size: vertex_input_buffer_memory_req.size,
+            memory_type_index: vertex_input_buffer_memory_index,
+            ..Default::default()
+        };
+
+        let vertex_input_buffer_memory = base
+            .device
+            .allocate_memory(&vertex_buffer_allocate_info, None)
+            .unwrap();
+
+        let vertices = [
+            Vertex {
+                pos: [-1.0, 1.0, 0.0, 1.0],
+                color: [0.0, 1.0, 0.0, 1.0],
+            },
+            Vertex {
+                pos: [1.0, 1.0, 0.0, 1.0],
+                color: [0.0, 0.0, 1.0, 1.0],
+            },
+            Vertex {
+                pos: [0.0, -1.0, 0.0, 1.0],
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+        ];
+
+        let vert_ptr = base
+            .device
+            .map_memory(
+                vertex_input_buffer_memory,
+                0,
+                vertex_input_buffer_memory_req.size,
+                vk::MemoryMapFlags::empty(),
+            )
+            .unwrap();
+
+        let mut vert_align = Align::new(
+            vert_ptr,
+            align_of::<Vertex>() as u64,
+            vertex_input_buffer_memory_req.size,
+        );
+        vert_align.copy_from_slice(&vertices);
+        base.device.unmap_memory(vertex_input_buffer_memory);
+        base.device
+            .bind_buffer_memory(vertex_input_buffer, vertex_input_buffer_memory, 0)
+            .unwrap();
+
+
+        let vertex_spv_data = inject_magic!(&include_bytes!(r"C:\Users\PCema\IdeaProjects\dino_beast\src\shader\vert.spv")[..]);
+        let frag_spv_data = inject_magic!(&include_bytes!(r"C:\Users\PCema\IdeaProjects\dino_beast\src\shader\frag.spv")[..]);
+
+
+        let mut vertex_spv_file = Cursor::new(&vertex_spv_data);
+        let mut frag_spv_file = Cursor::new(&frag_spv_data);
+
+        let vertex_code =
+            read_spv(&mut vertex_spv_file).expect("Failed to read vertex shader spv file");
+        let vertex_shader_info = vk::ShaderModuleCreateInfo::builder().code(&vertex_code);
+
+        let frag_code =
+            read_spv(&mut frag_spv_file).expect("Failed to read fragment shader spv file");
+        let frag_shader_info = vk::ShaderModuleCreateInfo::builder().code(&frag_code);
+
+        let vertex_shader_module = base
+            .device
+            .create_shader_module(&vertex_shader_info, None)
+            .expect("Vertex shader module error");
+
+        let fragment_shader_module = base
+            .device
+            .create_shader_module(&frag_shader_info, None)
+            .expect("Fragment shader module error");
+
+
+
+        let layout_create_info = vk::PipelineLayoutCreateInfo::default();
+
+        let pipeline_layout = base
+            .device
+            .create_pipeline_layout(&layout_create_info, None)
+            .unwrap();
+
+        let shader_entry_name = CStr::from_bytes_with_nul_unchecked(b"main\0");
+        let shader_stage_create_infos = [
+            vk::PipelineShaderStageCreateInfo {
+                module: vertex_shader_module,
+                p_name: shader_entry_name.as_ptr(),
+                stage: vk::ShaderStageFlags::VERTEX,
+                ..Default::default()
+            },
+            vk::PipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+                module: fragment_shader_module,
+                p_name: shader_entry_name.as_ptr(),
+                stage: vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+        ];
+        let vertex_input_binding_descriptions = [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: mem::size_of::<Vertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }];
+        let vertex_input_attribute_descriptions = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: offset_of!(Vertex, pos) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: offset_of!(Vertex, color) as u32,
+            },
+        ];
+
+        let vertex_input_state_info = vk::PipelineVertexInputStateCreateInfo::builder()
+            .vertex_attribute_descriptions(&vertex_input_attribute_descriptions)
+            .vertex_binding_descriptions(&vertex_input_binding_descriptions);
+        let vertex_input_assembly_state_info = vk::PipelineInputAssemblyStateCreateInfo {
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            ..Default::default()
+        };
+        let viewports = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: base.surface_resolution.width as f32,
+            height: base.surface_resolution.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        let scissors = [base.surface_resolution.into()];
+        let viewport_state_info = vk::PipelineViewportStateCreateInfo::builder()
+            .scissors(&scissors)
+            .viewports(&viewports);
+
+        let rasterization_info = vk::PipelineRasterizationStateCreateInfo {
+            front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+            line_width: 1.0,
+            polygon_mode: vk::PolygonMode::FILL,
+            ..Default::default()
+        };
+        let multisample_state_info = vk::PipelineMultisampleStateCreateInfo {
+            rasterization_samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        let noop_stencil_state = vk::StencilOpState {
+            fail_op: vk::StencilOp::KEEP,
+            pass_op: vk::StencilOp::KEEP,
+            depth_fail_op: vk::StencilOp::KEEP,
+            compare_op: vk::CompareOp::ALWAYS,
+            ..Default::default()
+        };
+        let depth_state_info = vk::PipelineDepthStencilStateCreateInfo {
+            depth_test_enable: 1,
+            depth_write_enable: 1,
+            depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
+            front: noop_stencil_state,
+            back: noop_stencil_state,
+            max_depth_bounds: 1.0,
+            ..Default::default()
+        };
+        let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState {
+            blend_enable: 0,
+            src_color_blend_factor: vk::BlendFactor::SRC_COLOR,
+            dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_DST_COLOR,
+            color_blend_op: vk::BlendOp::ADD,
+            src_alpha_blend_factor: vk::BlendFactor::ZERO,
+            dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+            alpha_blend_op: vk::BlendOp::ADD,
+            color_write_mask: vk::ColorComponentFlags::RGBA,
+        }];
+        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+            .logic_op(vk::LogicOp::CLEAR)
+            .attachments(&color_blend_attachment_states);
+
+        let dynamic_state = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state_info =
+            vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_state);
+
+        let graphic_pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&shader_stage_create_infos)
+            .vertex_input_state(&vertex_input_state_info)
+            .input_assembly_state(&vertex_input_assembly_state_info)
+            .viewport_state(&viewport_state_info)
+            .rasterization_state(&rasterization_info)
+            .multisample_state(&multisample_state_info)
+            .depth_stencil_state(&depth_state_info)
+            .color_blend_state(&color_blend_state)
+            .dynamic_state(&dynamic_state_info)
+            .layout(pipeline_layout)
+            .render_pass(renderpass);
+
+        let graphics_pipelines = base
+            .device
+            .create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                &[graphic_pipeline_info.build()],
+                None,
+            )
+            .expect("Unable to create graphics pipeline");
+
+        let graphic_pipeline = graphics_pipelines[0];
+
+        base.render_loop(|| {
+            let (present_index, _) = base
+                .swapchain_loader
+                .acquire_next_image(
+                    base.swapchain,
+                    std::u64::MAX,
+                    base.present_complete_semaphore,
+                    vk::Fence::null(),
+                )
+                .unwrap();
+            let clear_values = [
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 0.0],
+                    },
+                },
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                },
+            ];
+
+            let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
+                .render_pass(renderpass)
+                .framebuffer(framebuffers[present_index as usize])
+                .render_area(base.surface_resolution.into())
+                .clear_values(&clear_values);
+
+            record_submit_commandbuffer(
+                &base.device,
+                base.draw_command_buffer,
+                base.draw_commands_reuse_fence,
+                base.present_queue,
+                &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT],
+                &[base.present_complete_semaphore],
+                &[base.rendering_complete_semaphore],
+                |device, draw_command_buffer| {
+                    device.cmd_begin_render_pass(
+                        draw_command_buffer,
+                        &render_pass_begin_info,
+                        vk::SubpassContents::INLINE,
+                    );
+                    device.cmd_bind_pipeline(
+                        draw_command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        graphic_pipeline,
+                    );
+                    device.cmd_set_viewport(draw_command_buffer, 0, &viewports);
+                    device.cmd_set_scissor(draw_command_buffer, 0, &scissors);
+                    device.cmd_bind_vertex_buffers(
+                        draw_command_buffer,
+                        0,
+                        &[vertex_input_buffer],
+                        &[0],
+                    );
+                    device.cmd_bind_index_buffer(
+                        draw_command_buffer,
+                        index_buffer,
+                        0,
+                        vk::IndexType::UINT32,
+                    );
+                    device.cmd_draw_indexed(
+                        draw_command_buffer,
+                        index_buffer_data.len() as u32,
+                        1,
+                        0,
+                        0,
+                        1,
+                    );
+                    // Or draw without the index buffer
+                    // device.cmd_draw(draw_command_buffer, 3, 1, 0, 0);
+                    device.cmd_end_render_pass(draw_command_buffer);
+                },
+            );
+            //let mut present_info_err = mem::zeroed();
+            let wait_semaphors = [base.rendering_complete_semaphore];
+            let swapchains = [base.swapchain];
+            let image_indices = [present_index];
+            let present_info = vk::PresentInfoKHR::builder()
+                .wait_semaphores(&wait_semaphors) // &base.rendering_complete_semaphore)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+
+            base.swapchain_loader
+                .queue_present(base.present_queue, &present_info)
+                .unwrap();
+        });
+
+        base.device.device_wait_idle().unwrap();
+        for pipeline in graphics_pipelines {
+            base.device.destroy_pipeline(pipeline, None);
+        }
+        base.device.destroy_pipeline_layout(pipeline_layout, None);
+        base.device
+            .destroy_shader_module(vertex_shader_module, None);
+        base.device
+            .destroy_shader_module(fragment_shader_module, None);
+        base.device.free_memory(index_buffer_memory, None);
+        base.device.destroy_buffer(index_buffer, None);
+        base.device.free_memory(vertex_input_buffer_memory, None);
+        base.device.destroy_buffer(vertex_input_buffer, None);
+        for framebuffer in framebuffers {
+            base.device.destroy_framebuffer(framebuffer, None);
+        }
+        base.device.destroy_render_pass(renderpass, None);
+    }
+    Ok(())
 }
-
-
-
-
-
-
-
-
-
-//
-//     const NUM_DINOS: usize = 1;
-//     const NUM_FOOD: usize = 1;
-//     const SCREEN_WIDTH: f32 = 1000.0;
-//     const SCREEN_HEIGHT: f32 = 800.0;
-//     const STEP: f32 = 0.5;
-//     const FOOD_SIZE: f32 = 6.0;
-//     const DINO_SIZE: f32 = 6.0;
-//
-//     struct MainState {
-//         dino_x: Vec<f32>,
-//         dino_y: Vec<f32>,
-//         dino_dist: Vec<f32>,
-//         food_x: Vec<f32>,
-//         food_y: Vec<f32>,
-//         food_index_buffer: Vec<usize>,
-//         full: Vec<usize>,
-//         hungry: Vec<usize>,
-//     }
-//
-//     impl MainState {
-//         fn new() -> GameResult<Self> {
-//             let mut rng = rand::thread_rng();
-//             let mut dino_x: Vec<f32> = Vec::with_capacity(NUM_DINOS);
-//             let mut dino_y: Vec<f32> = Vec::with_capacity(NUM_DINOS);
-//             let mut food_x: Vec<f32> = Vec::with_capacity(NUM_FOOD);
-//             let mut food_y: Vec<f32> = Vec::with_capacity(NUM_FOOD);
-//             let mut dino_dist: Vec<f32> = Vec::with_capacity(NUM_DINOS);
-//             let mut food_index_buffer: Vec<usize> = Vec::with_capacity(NUM_DINOS);
-//
-//             let mut full: Vec<usize> = Vec::with_capacity(NUM_DINOS);
-//             let mut hungry: Vec<usize> = (0..NUM_DINOS).collect();
-//
-//             // random dino pos
-//         for _ in 0..NUM_DINOS {
-//             dino_x.push(rng.gen_range(0.0..SCREEN_WIDTH));
-//             dino_y.push(rng.gen_range(0.0..SCREEN_HEIGHT));
-//         }
-//
-//         // random food pos
-//         for _ in 0..NUM_FOOD {
-//             food_x.push(rng.gen_range(0.0..SCREEN_WIDTH));
-//             food_y.push(rng.gen_range(0.0..SCREEN_HEIGHT));
-//         }
-//
-//         // dino dist
-//         for dino in 0..NUM_DINOS {
-//             let dino_x = dino_x[dino];
-//             let dino_y = dino_y[dino];
-//             let mut min_dist = f32::MAX;
-//             let mut mindex: usize = 0;
-//             for food in 0..NUM_FOOD {
-//                 let dist = dist_of_xyxy(dino_x, dino_y, food_x[food], food_y[food]);
-//                 if dist < min_dist {
-//                     min_dist = dist;
-//                     mindex = food;
-//                 }
-//             }
-//             dino_dist.push(min_dist);
-//             food_index_buffer.push(mindex);
-//         }
-//
-//         Ok(Self {
-//             dino_x,
-//             dino_y,
-//             dino_dist,
-//             food_x,
-//             food_y,
-//             food_index_buffer,
-//             full,
-//             hungry,
-//         })
-//     }
-// }
-//
-//
-//
-// impl event::EventHandler<ggez::GameError> for MainState {
-//     fn update(&mut self, ctx: &mut Context) -> GameResult {
-//         for dino in 0..NUM_DINOS {
-//             unimplemented!("DONT MAKE IT HAVE TOO MANY MEMORY ACCESS THINGS");
-//             let dino_x = self.dino_x[dino];
-//             let dino_y = self.dino_y[dino];
-//             let dist = self.dino_dist[dino];
-//             let food_index = self.food_index_buffer[dino];
-//             let food_x = self.food_x[food_index];
-//             let food_y = self.food_y[food_index];
-//
-//             // dists[0] is at 0 to 90
-//             // dists[1] is at 90 to 180
-//             // dists[2] is at 180 to 270
-//             // dists[3] is at 270 to 360
-//             let dists = [
-//                 dist_of_xyxy(dino_x + dist, dino_y, food_x, food_y),
-//                 dist_of_xyxy(dino_x, dino_y - dist, food_x, food_y),
-//                 dist_of_xyxy(dino_x - dist, dino_y, food_x, food_y),
-//                 dist_of_xyxy(dino_x, dino_y + dist, food_x, food_y),
-//             ];
-//
-//             let mut min = f32::MAX;
-//             let mut second = f32::MAX;
-//             let mut min_quad: usize = 0;
-//             let mut second_quad: usize = 0;
-//             for (index, dist) in dists.iter().enumerate() {
-//                 if *dist < min {
-//                     second = min;
-//                     min = *dist;
-//                     second_quad = min_quad;
-//                     min_quad = index;
-//                 } else if *dist < second {
-//                     second = *dist;
-//                     second_quad = index;
-//                 }
-//             }
-//
-//             let min = min_quad;
-//             let second = second_quad;
-//
-//             let (start, rev) = match (min, second) {
-//                 (0, 1) => (0, 0),
-//                 (1, 0) =>  (0, 1),
-//                 (1, 2) => (1, 0),
-//                 (2, 1) => (1, 1),
-//                 (2, 3) => (2, 0),
-//                 (3, 2) => (2, 1),
-//                 (3, 0) => (3, 0),
-//                 (0, 3) => (3, 1),
-//                 (_, _) => (0, 0)
-//             };
-//
-//             let mut range: [f32; 90] = if rev == 1 {
-//                 RAD_ARRAY[start].into_iter().rev().collect::<Vec<f32>>().try_into().unwrap()
-//             } else {
-//                 RAD_ARRAY[start]
-//             };
-//
-//             for angle in range {
-//                 let new_x = dino_x + dist * angle.cos();
-//                 let new_y = dino_y + dist * angle.sin();
-//                 let new_dist = dist_of_xyxy(new_x, new_y, food_x, food_y);
-//                 if new_dist < DINO_SIZE + FOOD_SIZE {
-//                     self.dino_x[dino] += dino_x - new_x;
-//                     self.dino_y[dino] += dino_y - new_y;
-//                     self.dino_dist[dino] = new_dist;
-//                 }
-//             }
-//
-//         }
-//         // println!("fps {:?}", ctx.time.fps());
-//         Ok(())
-//     }
-//
-//     fn draw(&mut self, ctx: &mut Context) -> GameResult {
-//         let mut canvas =
-//             graphics::Canvas::from_frame(ctx, graphics::Color::from([0.1, 0.2, 0.3, 1.0]));
-//
-//         let dino_mesh = graphics::Mesh::new_circle(
-//             ctx,
-//             graphics::DrawMode::fill(),
-//             Vec2::new(0.0, 0.0),
-//             DINO_SIZE,
-//             2.0,
-//             Color::GREEN,
-//         )?;
-//
-//         let food_mesh = graphics::Mesh::new_circle(
-//             ctx,
-//             graphics::DrawMode::fill(),
-//             Vec2::new(0.0, 0.0),
-//             FOOD_SIZE,
-//             2.0,
-//             Color::RED,
-//         )?;
-//
-//         let radius_mesh = graphics::Mesh::new_circle(
-//             ctx,
-//             graphics::DrawMode::stroke(5.0),
-//             Vec2::new(0.0, 0.0),
-//             self.dino_dist[0],
-//             1.0,
-//             Color::BLACK,
-//         )?;
-//
-//         canvas.draw(&radius_mesh, Vec2::new(self.dino_x[0], self.dino_y[0]));
-//         for index in 0..NUM_FOOD {
-//             canvas.draw(
-//                 &food_mesh,
-//                 Vec2::new(self.food_x[index], self.food_y[index]),
-//             );
-//         }
-//         for index in 0..NUM_DINOS {
-//             canvas.draw(
-//                 &dino_mesh,
-//                 Vec2::new(self.dino_x[index], self.dino_y[index]),
-//             );
-//         }
-//         canvas.finish(ctx)?;
-//         Ok(())
-//     }
-// }
-//
-// fn dist_of_xyxy(x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
-//     ((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1)).sqrt()
-// }
-//
-// fn main() -> GameResult {
-//     assert!(NUM_DINOS != 0);
-//     assert!(NUM_FOOD != 0);
-//     let cb = ggez::ContextBuilder::new("Dino Beast", "Mac")
-//         .window_setup(
-//             ggez::conf::WindowSetup::default()
-//                 .title("Dino Beast")
-//                 .vsync(false),
-//         )
-//         .window_mode(ggez::conf::WindowMode::default().dimensions(SCREEN_WIDTH, SCREEN_HEIGHT));
-//     let (ctx, event_loop) = cb.build()?;
-//     let state = MainState::new()?;
-//     event::run(ctx, event_loop, state)
-// }
-//
-// const RAD_ARRAY: [[f32; 90]; 4] = [
-//     [
-//         0.017453292,
-//         0.034906585,
-//         0.05235988,
-//         0.06981317,
-//         0.08726647,
-//         0.10471976,
-//         0.122173056,
-//         0.13962634,
-//         0.15707964,
-//         0.17453294,
-//         0.19198623,
-//         0.20943952,
-//         0.22689281,
-//         0.24434611,
-//         0.2617994,
-//         0.27925268,
-//         0.296706,
-//         0.31415927,
-//         0.33161256,
-//         0.34906587,
-//         0.36651915,
-//         0.38397247,
-//         0.40142572,
-//         0.41887903,
-//         0.43633232,
-//         0.45378563,
-//         0.4712389,
-//         0.48869222,
-//         0.5061455,
-//         0.5235988,
-//         0.5410521,
-//         0.55850536,
-//         0.57595867,
-//         0.593412,
-//         0.6108653,
-//         0.62831855,
-//         0.64577186,
-//         0.6632251,
-//         0.6806784,
-//         0.69813174,
-//         0.715585,
-//         0.7330383,
-//         0.75049156,
-//         0.76794493,
-//         0.7853982,
-//         0.80285144,
-//         0.8203048,
-//         0.83775806,
-//         0.8552114,
-//         0.87266463,
-//         0.890118,
-//         0.90757126,
-//         0.9250245,
-//         0.9424778,
-//         0.9599311,
-//         0.97738445,
-//         0.9948377,
-//         1.012291,
-//         1.0297443,
-//         1.0471976,
-//         1.0646509,
-//         1.0821042,
-//         1.0995575,
-//         1.1170107,
-//         1.134464,
-//         1.1519173,
-//         1.1693707,
-//         1.186824,
-//         1.2042772,
-//         1.2217306,
-//         1.2391838,
-//         1.2566371,
-//         1.2740904,
-//         1.2915437,
-//         1.308997,
-//         1.3264502,
-//         1.3439035,
-//         1.3613569,
-//         1.3788102,
-//         1.3962635,
-//         1.4137167,
-//         1.43117,
-//         1.4486233,
-//         1.4660766,
-//         1.4835298,
-//         1.5009831,
-//         1.5184366,
-//         1.5358899,
-//         1.553343,
-//         1.5707964,
-//     ],
-//     [
-//         1.5882497, 1.6057029, 1.6231562, 1.6406096, 1.6580629, 1.6755161, 1.6929694, 1.7104228,
-//         1.727876, 1.7453293, 1.7627826, 1.780236, 1.7976892, 1.8151425, 1.8325958, 1.850049,
-//         1.8675023, 1.8849556, 1.9024088, 1.9198622, 1.9373156, 1.9547689, 1.9722221, 1.9896754,
-//         2.0071287, 2.024582, 2.0420353, 2.0594885, 2.076942, 2.0943952, 2.1118484, 2.1293018,
-//         2.146755, 2.1642084, 2.1816616, 2.199115, 2.2165682, 2.2340214, 2.2514749, 2.268928,
-//         2.2863812, 2.3038347, 2.321288, 2.3387413, 2.3561945, 2.373648, 2.3911011, 2.4085543,
-//         2.4260077, 2.4434612, 2.4609144, 2.4783676, 2.495821, 2.5132742, 2.5307274, 2.5481808,
-//         2.5656343, 2.5830874, 2.6005406, 2.617994, 2.6354473, 2.6529005, 2.670354, 2.687807,
-//         2.7052603, 2.7227137, 2.7401671, 2.7576203, 2.7750735, 2.792527, 2.8099802, 2.8274333,
-//         2.8448865, 2.86234, 2.8797934, 2.8972466, 2.9147, 2.9321532, 2.9496067, 2.9670596,
-//         2.984513, 3.0019662, 3.0194197, 3.036873, 3.0543263, 3.0717797, 3.0892327, 3.106686,
-//         3.1241393, 3.1415927,
-//     ],
-//     [
-//         3.1590462, 3.1764994, 3.1939528, 3.2114058, 3.2288592, 3.2463124, 3.2637658, 3.2812192,
-//         3.2986724, 3.3161259, 3.3335788, 3.3510323, 3.3684855, 3.385939, 3.4033923, 3.4208455,
-//         3.438299, 3.455752, 3.4732053, 3.4906585, 3.508112, 3.5255651, 3.5430186, 3.560472,
-//         3.577925, 3.5953784, 3.6128316, 3.630285, 3.6477382, 3.6651917, 3.682645, 3.700098,
-//         3.7175512, 3.7350047, 3.752458, 3.7699113, 3.7873647, 3.8048177, 3.822271, 3.8397243,
-//         3.8571777, 3.8746312, 3.8920844, 3.9095378, 3.9269907, 3.9444442, 3.9618974, 3.9793508,
-//         3.9968042, 4.0142574, 4.0317106, 4.049164, 4.066617, 4.0840707, 4.101524, 4.118977,
-//         4.1364307, 4.153884, 4.1713367, 4.1887903, 4.2062435, 4.2236967, 4.2411504, 4.2586036,
-//         4.276057, 4.29351, 4.310963, 4.328417, 4.34587, 4.363323, 4.3807764, 4.39823, 4.415683,
-//         4.4331365, 4.4505897, 4.468043, 4.4854965, 4.5029497, 4.520403, 4.537856, 4.5553093,
-//         4.5727625, 4.590216, 4.6076694, 4.6251225, 4.642576, 4.660029, 4.6774826, 4.694936,
-//         4.712389,
-//     ],
-//     [
-//         4.7298427, 4.747296, 4.764749, 4.7822022, 4.7996554, 4.8171086, 4.8345623, 4.8520155,
-//         4.8694687, 4.8869224, 4.904375, 4.9218287, 4.939282, 4.956735, 4.974189, 4.991642,
-//         5.009095, 5.0265484, 5.0440016, 5.061455, 5.0789084, 5.0963616, 5.113815, 5.1312685,
-//         5.148721, 5.166175, 5.183628, 5.2010813, 5.2185345, 5.235988, 5.253441, 5.2708945,
-//         5.2883477, 5.305801, 5.3232546, 5.340708, 5.358161, 5.375614, 5.3930674, 5.4105206,
-//         5.427974, 5.4454274, 5.4628806, 5.4803343, 5.497787, 5.5152407, 5.532694, 5.550147,
-//         5.5676007, 5.585054, 5.602507, 5.6199603, 5.6374135, 5.6548667, 5.6723204, 5.689773,
-//         5.7072268, 5.72468, 5.742133, 5.759587, 5.77704, 5.794493, 5.8119464, 5.8294, 5.8468533,
-//         5.8643064, 5.88176, 5.8992133, 5.9166665, 5.934119, 5.951573, 5.969026, 5.9864793,
-//         6.0039325, 6.021386, 6.0388393, 6.0562925, 6.073746, 6.0911994, 6.1086526, 6.1261063,
-//         6.1435595, 6.161012, 6.1784654, 6.1959186, 6.213372, 6.2308254, 6.2482786, 6.2657323,
-//         6.2831855,
-//     ],
-// ];
