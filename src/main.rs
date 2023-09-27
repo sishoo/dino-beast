@@ -11,6 +11,9 @@ use std::io::Cursor;
 mod lib;
 use lib::*;
 use std::io::Seek;
+use std::io::SeekFrom;
+use std::slice;
+use std::fs::File;
 
 const SPIRV_MAGIC_NUM: u32 = 0x07230203;
 
@@ -20,18 +23,28 @@ struct Vertex {
     color: [f32; 4],
 }
 
-macro_rules! inject_magic {
-    ($thing:expr) => {{
-        let mut new = $thing.to_vec();
-        let magic_bytes = SPIRV_MAGIC_NUM.to_be_bytes();
-        new.insert(0, magic_bytes[0]);
-        new.insert(1, magic_bytes[1]);
-        new.insert(2, magic_bytes[2]);
-        new.insert(3, magic_bytes[3]);
-        // new.insert(4, b'\n');
-        let padding: Vec<u8> = (0..(4 - (new.len() % 4))).map(|x| x as u8).collect();
-        new.extend(padding);
-        new
+macro_rules! format_spv_file {
+    ($file:expr) => {{
+        let mut file = $file;
+        let mut res: Vec<u8> = Vec::new();
+        let size = file.read_to_end(&mut res)?;
+        let magic_bytes = SPIRV_MAGIC_NUM.to_le_bytes();
+        res.insert(0, magic_bytes[0]);
+        res.insert(1, magic_bytes[1]);
+        res.insert(2, magic_bytes[2]);
+        res.insert(3, magic_bytes[3]);
+        if res.len() % 4 != 0 {
+            let pad = vec![0b0; 4 - (res.len() % 4)];
+            res.extend(pad);
+        }
+        let mut packed: Vec<u32> = Vec::with_capacity(res.len() / 4);
+        for (index, num) in res.iter().enumerate().step_by(4) {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&res[index..index + 4]);
+            let val = u32::from_le_bytes(bytes);
+            packed.push(val);
+        }
+        packed
     }}
 }
 
@@ -220,20 +233,18 @@ fn main() -> std::io::Result<()> {
             .bind_buffer_memory(vertex_input_buffer, vertex_input_buffer_memory, 0)
             .unwrap();
 
+        // r"C:\Users\PCema\IdeaProjects\dino_beast\src\shader\vert.spv"
+        // r"C:\Users\PCema\IdeaProjects\dino_beast\src\shader\frag.spv"
 
-        let vertex_spv_data = inject_magic!(&include_bytes!(r"C:\Users\PCema\IdeaProjects\dino_beast\src\shader\vert.spv")[..]);
-        let frag_spv_data = inject_magic!(&include_bytes!(r"C:\Users\PCema\IdeaProjects\dino_beast\src\shader\frag.spv")[..]);
+        // let mut vertex_spv_file = Cursor::new(&include_bytes!(r"/Users/macfarrell/IdeaProjects/dino_beast/src/shader/vert.spv")[..]);
+        // let mut frag_spv_file = Cursor::new(&include_bytes!(r"/Users/macfarrell/IdeaProjects/dino_beast/src/shader/frag.spv")[..]);
 
+        let vertex_spv_file = File::open(r"/Users/macfarrell/IdeaProjects/dino_beast/src/shader/vert.spv")?;
+        let frag_spv_file = File::open(r"/Users/macfarrell/IdeaProjects/dino_beast/src/shader/frag.spv")?;
 
-        let mut vertex_spv_file = Cursor::new(&vertex_spv_data);
-        let mut frag_spv_file = Cursor::new(&frag_spv_data);
-
-        let vertex_code =
-            read_spv(&mut vertex_spv_file).expect("Failed to read vertex shader spv file");
+        let vertex_code = format_spv_file!(vertex_spv_file);
+        let frag_code = format_spv_file!(frag_spv_file);
         let vertex_shader_info = vk::ShaderModuleCreateInfo::builder().code(&vertex_code);
-
-        let frag_code =
-            read_spv(&mut frag_spv_file).expect("Failed to read fragment shader spv file");
         let frag_shader_info = vk::ShaderModuleCreateInfo::builder().code(&frag_code);
 
         let vertex_shader_module = base
@@ -245,7 +256,6 @@ fn main() -> std::io::Result<()> {
             .device
             .create_shader_module(&frag_shader_info, None)
             .expect("Fragment shader module error");
-
 
 
         let layout_create_info = vk::PipelineLayoutCreateInfo::default();
